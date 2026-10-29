@@ -220,8 +220,23 @@ const API_TEST: &str = r#"(async () => {
     check((await app.inspect()).bodies[0].name === 'Browser API box', 'source design is active');
     await app.request('ui.documents', {action: 'switch', index: 0});
     check((await app.execute('component.links')).links[0].component === linked.component, 'assembly remains in its tab');
+    await app.request('ui.documents', {action: 'switch', index: 1});
+    await app.execute('file.export', {path: '/host/box.step'});
+    const step = await app.readFile('/host/box.step');
+    check(step instanceof Uint8Array && new TextDecoder().decode(step.subarray(0, 13)) === 'ISO-10303-21;', 'readFile returns the exported STEP bytes');
+    // An embedding page passes arrays made in its own window.
+    const host = document.body.appendChild(document.createElement('iframe'));
+    await app.writeFile('/host/copy.step', new host.contentWindow.Uint8Array(step));
+    host.remove();
+    await app.execute('doc.open', {path: '/host/copy.step'});
+    check((await app.inspect({measure: true})).bodies.some(body => Math.abs(body.volume_mm3 - 6000) < 0.01), 'a file the host wrote opens as a design');
+    await rejects(() => app.readFile('/host/missing.step'), 'no such file');
+    await rejects(() => app.readFile('/downloads/box.step'), 'memory paths');
+    await rejects(() => app.writeFile('/opfs/host.step', step), 'memory paths');
+    await rejects(() => app.writeFile('/host/text.step', 'ISO-10303-21;'), 'Uint8Array');
     return {commands: 'discovered', bodies: [0, 1, 0, 1], errors: 'rejected', queue: '256 completed, 1 rejected',
-        dxf: 'omit and dashed exported; dialog download checked', linked: 'source opened from browser storage'};
+        dxf: 'omit and dashed exported; dialog download checked', linked: 'source opened from browser storage',
+        host_files: 'exported STEP read, written back and opened'};
 })()"#;
 
 /// Run the test; `required: false` (from `cargo xtask ci`) skips it when Chrome is missing.

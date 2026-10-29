@@ -6,8 +6,11 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError};
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use solidcraft_engine::io::vfs;
 use solidcraft_ui_egui::ControlRequest;
 use wasm_bindgen::{JsValue, closure::Closure};
+
+use crate::disk;
 
 const MAX_PENDING: usize = 256;
 const MAX_JSON_BYTES: usize = 16 * 1024 * 1024;
@@ -40,6 +43,49 @@ fn error(message: &str) -> JsValue {
     js_sys::Error::new(message).into()
 }
 
+/// Host files stay in memory: the private storage, disk and download paths are only filled from
+/// what commands write, which `files::flush` forwards, and a file inserted there would never be stored.
+fn host_path(path: &str) -> Result<&str, String> {
+    if disk::route(path) == disk::WriteTo::Memory {
+        Ok(path)
+    } else {
+        Err(format!("{path}: readFile and writeFile take memory paths, not {}, {} or {} paths", disk::OPFS_PREFIX, disk::PREFIX, disk::DOWNLOADS_PREFIX))
+    }
+}
+
+fn read_file(path: String) -> js_sys::Promise {
+    match host_path(&path).and_then(|path| vfs::read(path, usize::MAX).map_err(|e| e.to_string())) {
+        Ok(bytes) => js_sys::Promise::resolve(&JsValue::from(js_sys::Uint8Array::from(bytes.as_slice()))),
+        Err(message) => js_sys::Promise::reject(&error(&message)),
+    }
+}
+
+/// The bytes behind a typed array or `DataView`. A page that embeds the app passes arrays made in
+/// its own window, which an `instanceof Uint8Array` check in this window rejects.
+fn view_bytes(value: &JsValue) -> Option<Vec<u8>> {
+    if !js_sys::ArrayBuffer::is_view(value) {
+        return None;
+    }
+    let get = |name: &str| js_sys::Reflect::get(value, &name.into()).ok();
+    let buffer = get("buffer")?;
+    let offset = get("byteOffset")?.as_f64()? as u32;
+    let length = get("byteLength")?.as_f64()? as u32;
+    Some(js_sys::Uint8Array::new_with_byte_offset_and_length(&buffer, offset, length).to_vec())
+}
+
+fn write_file(path: String, bytes: JsValue) -> js_sys::Promise {
+    let Some(bytes) = view_bytes(&bytes) else {
+        return js_sys::Promise::reject(&error("writeFile takes the file's bytes as a Uint8Array"));
+    };
+    match host_path(&path) {
+        Ok(path) => {
+            vfs::insert(path, bytes);
+            js_sys::Promise::resolve(&JsValue::UNDEFINED)
+        }
+        Err(message) => js_sys::Promise::reject(&error(&message)),
+    }
+}
+
 impl Api {
     pub fn install(sender: Sender<ControlRequest>, ctx: egui::Context) -> Result<Self, JsValue> {
         let api = Self { sender, pending: Rc::default(), ctx };
@@ -69,6 +115,8 @@ impl Api {
                 Closure::<dyn Fn(JsValue) -> js_sys::Promise>::new(move |value: JsValue| inspect.request("document.inspect", params(&value)))
                     .into_js_value(),
             ),
+            ("readFile", Closure::<dyn Fn(String) -> js_sys::Promise>::new(read_file).into_js_value()),
+            ("writeFile", Closure::<dyn Fn(String, JsValue) -> js_sys::Promise>::new(write_file).into_js_value()),
         ] {
             js_sys::Reflect::set(&object, &name.into(), &function)?;
         }
